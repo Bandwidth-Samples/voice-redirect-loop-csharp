@@ -65,7 +65,7 @@ Below are the callback paths:
 A simple way to set up a local callback URL for testing is to use the free tool [ngrok](https://ngrok.com/).  
 After you have downloaded and installed `ngrok` run the following command to open a public tunnel to your port (`5001`)
 
-```sh
+```cmd
 ngrok http 5001
 ```
 
