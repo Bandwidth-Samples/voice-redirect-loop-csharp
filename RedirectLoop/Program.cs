@@ -5,121 +5,146 @@ using Bandwidth.Standard.Model.Bxml;
 using Bandwidth.Standard.Model.Bxml.Verbs;
 using Newtonsoft.Json;
 
-var builder = WebApplication.CreateBuilder(args);
-var app = builder.Build();
-
-string BW_USERNAME;
-string BW_PASSWORD;
-string BW_ACCOUNT_ID;
-string BASE_CALLBACK_URL;
-
-
 //Setting up environment variables
-try
-{
-    BW_USERNAME = Environment.GetEnvironmentVariable("BW_USERNAME");
-    BW_PASSWORD = Environment.GetEnvironmentVariable("BW_PASSWORD");
-    BW_ACCOUNT_ID = Environment.GetEnvironmentVariable("BW_ACCOUNT_ID");
-    BASE_CALLBACK_URL = Environment.GetEnvironmentVariable("BASE_CALLBACK_URL");
-}
-catch (Exception)
+string? BW_ACCOUNT_ID = Environment.GetEnvironmentVariable("BW_ACCOUNT_ID");
+string? BW_CLIENT_ID = Environment.GetEnvironmentVariable("BW_CLIENT_ID");
+string? BW_CLIENT_SECRET = Environment.GetEnvironmentVariable("BW_CLIENT_SECRET");
+string? BASE_CALLBACK_URL = Environment.GetEnvironmentVariable("BASE_CALLBACK_URL");
+string? LOCAL_PORT = Environment.GetEnvironmentVariable("LOCAL_PORT");
+
+if (BW_ACCOUNT_ID == null || BW_CLIENT_ID == null || BW_CLIENT_SECRET == null || BASE_CALLBACK_URL == null
+    || !int.TryParse(LOCAL_PORT, out int port))
 {
     Console.WriteLine("Please set the environmental variables defined in the README");
-    throw;
+    Environment.Exit(1);
+    return;
 }
 
+var builder = WebApplication.CreateBuilder(args);
+builder.WebHost.UseUrls($"http://localhost:{port}");
+var app = builder.Build();
+
 Configuration configuration = new Configuration();
-configuration.Username = BW_USERNAME;
-configuration.Password = BW_PASSWORD;
+configuration.OAuthClientId = BW_CLIENT_ID;
+configuration.OAuthClientSecret = BW_CLIENT_SECRET;
 
-List<string> activeCalls = new List<string>();
+var activeCalls = new HashSet<string>();
 
-app.MapPost("/callbacks/inboundCall", async (HttpContext context) =>
+async Task<Dictionary<string, object>?> ReadBody(HttpContext context)
 {
-    var requestBody = new Dictionary<string, string>();
-    using(var streamReader = new StreamReader(context.Request.Body))
+    try
     {
-        var body = await streamReader.ReadToEndAsync();
-        requestBody = JsonConvert.DeserializeObject<Dictionary<string,string>>(body);
+        using var streamReader = new StreamReader(context.Request.Body);
+        return JsonConvert.DeserializeObject<Dictionary<string, object>>(await streamReader.ReadToEndAsync());
     }
+    catch (JsonException)
+    {
+        return null;
+    }
+}
 
-    var eventType = requestBody["eventType"];
+app.MapPost("/callbacks/inbound/voice", async (HttpContext context) =>
+{
+    var requestBody = await ReadBody(context);
+    var eventType = requestBody?.GetValueOrDefault("eventType")?.ToString();
+    if (eventType != "initiate" && eventType != "redirect")
+    {
+        return Results.BadRequest();
+    }
 
     if (eventType == "initiate")
     {
-        activeCalls.Add(requestBody["callId"]);
+        activeCalls.Add(requestBody!.GetValueOrDefault("callId")?.ToString()!);
     }
 
-    if (eventType == "initiate" || eventType == "redirect")
-    {
-        SpeakSentence unavailableSpeakSentence = new SpeakSentence()
+    var response = new Response();
+    response.Add
+    (
+        new SpeakSentence()
         {
             Text = "Redirecting call, please wait."
-        };
-        Ring ring = new Ring()
+        }
+    );
+    response.Add
+    (
+        new Ring()
         {
             Duration = 30
-        };
-        Redirect redirect = new Redirect()
+        }
+    );
+    response.Add
+    (
+        new Redirect()
         {
-            RedirectUrl =  "/callbacks/inboundCall"
-        };
-        Response response = new Response(new IVerb[] { unavailableSpeakSentence, ring, redirect });
+            RedirectUrl = "/callbacks/inbound/voice"
+        }
+    );
 
-        return response.ToBXML();
-    };
-    return "";
+    return Results.Content(response.ToBXML(), "application/xml");
 });
 
-app.MapPost("/callbacks/callEnded", async (HttpContext context) =>
+app.MapPost("/callbacks/inbound/voice/callEnded", async (HttpContext context) =>
 {
-    var requestBody = new Dictionary<string, string>();
-    using(var streamReader = new StreamReader(context.Request.Body))
+    var requestBody = await ReadBody(context);
+    if (requestBody == null || requestBody.GetValueOrDefault("eventType")?.ToString() != "redirect")
     {
-        var body = await streamReader.ReadToEndAsync();
-        requestBody = JsonConvert.DeserializeObject<Dictionary<string,string>>(body);
+        return Results.BadRequest();
     }
 
-    var eventType = requestBody["eventType"];
-
-    if (eventType == "redirect")
-    {
-        SpeakSentence speakSentence = new SpeakSentence()
+    var response = new Response();
+    response.Add
+    (
+        new SpeakSentence()
         {
-            Text = "The call has been ended. Goodbye"
-        };
-        Response response = new Response(new IVerb[] { speakSentence });
-        activeCalls.Remove(requestBody["callId"]);
-        return response.ToBXML();
-    };
-    return "";
+            Text = "The call has been ended. Goodbye."
+        }
+    );
+    response.Add
+    (
+        new Hangup()
+    );
+
+    return Results.Content(response.ToBXML(), "application/xml");
 });
 
-app.MapDelete("/calls/{callId}", async (string callId, HttpContext context) =>
+app.MapPost("/callbacks/inbound/voice/disconnect", async (HttpContext context) =>
 {
-    if (activeCalls.Contains(callId))
+    var requestBody = await ReadBody(context);
+    if (requestBody == null || requestBody.GetValueOrDefault("eventType")?.ToString() != "disconnect")
     {
-        UpdateCall updateCall = new UpdateCall(
-            state: CallStateEnum.Active,
-            redirectUrl: BASE_CALLBACK_URL + "/callbacks/callEnded",
-            redirectMethod: RedirectMethodEnum.POST
-        );
-        var apiInstance = new CallsApi(configuration);
+        return Results.BadRequest();
+    }
+
+    activeCalls.Remove(requestBody.GetValueOrDefault("callId")?.ToString() ?? "");
+    return Results.NoContent();
+});
+
+app.MapGet("/calls", () => Results.Json(activeCalls));
+
+app.MapDelete("/calls/{callId}", async (string callId) =>
+{
+    if (!activeCalls.Contains(callId))
+    {
+        return Results.NotFound();
+    }
+
+    UpdateCall updateCall = new UpdateCall(
+        redirectUrl: BASE_CALLBACK_URL + "/callbacks/inbound/voice/callEnded"
+    );
+
+    try
+    {
+        CallsApi apiInstance = new CallsApi(configuration);
         await apiInstance.UpdateCallAsync(BW_ACCOUNT_ID, callId, updateCall);
-        activeCalls.Remove(callId);
-        
-        return $"call {callId} will be ended";
     }
-    else
+    catch (Exception e)
     {
-        Results.NotFound();
-        return "call not found";
+        Console.WriteLine($"Failed to update call: {e.Message}");
+        return Results.StatusCode(500);
     }
-});
 
-app.MapGet("/calls", (HttpContext context) =>
-{
-    return activeCalls;
+    activeCalls.Remove(callId);
+    return Results.NoContent();
 });
 
 app.Run();
